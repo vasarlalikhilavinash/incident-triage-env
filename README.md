@@ -16,6 +16,15 @@ A real-world **production incident triage** environment for [OpenEnv](https://gi
 
 The agent must inspect production incidents, assess severity, categorize root causes, assign response teams, and recommend immediate actions — just like a real SRE would during an on-call shift.
 
+## Key Features
+
+- **20 diverse production incidents** spanning 8 categories (database, API, infrastructure, security, application, deployment, monitoring, network)
+- **Multi-step investigation**: `inspect` reveals surface symptoms; `diagnose` uncovers deep root cause analysis
+- **Dependency chain identification**: `link_incidents` lets agents declare causal relationships between incidents
+- **Escalation mechanics**: Untriaged incidents worsen over time, testing prioritization under pressure
+- **4 difficulty tiers**: easy (1 incident) → medium (3) → hard (5 with cascades) → expert (8 with red herrings, hidden dependencies, and escalation)
+- **7-dimension grading**: severity, category, team, action quality, dependency identification, diagnosis depth, and efficiency
+
 ## Motivation
 
 Incident triage is a critical, high-stakes task performed daily by thousands of SREs worldwide. Poor triage leads to delayed response, extended outages, and escalated customer impact. This environment provides a structured benchmark for evaluating how well AI agents can:
@@ -33,11 +42,13 @@ The agent sends structured JSON actions with a `command` field:
 | Command | Fields | Description |
 |---------|--------|-------------|
 | `view_queue` | — | View all incidents with status summaries |
-| `inspect` | `incident_id` | View full incident details (logs, metrics, changes) |
+| `inspect` | `incident_id` | View surface-level incident details (logs, metrics, changes) |
+| `diagnose` | `incident_id` | Deep root-cause analysis — reveals hidden logs, heap dumps, network traces, and dependency hints |
 | `set_severity` | `incident_id`, `value` | Set severity: `P0` (critical) / `P1` (major) / `P2` (moderate) / `P3` (low) |
 | `set_category` | `incident_id`, `value` | Set category: `database`, `api`, `infrastructure`, `security`, `application`, `deployment`, `monitoring`, `network` |
 | `assign_team` | `incident_id`, `value` | Assign team: `database-team`, `platform-team`, `infra-team`, `security-team`, `backend-team`, `frontend-team`, `devops-team`, `sre-team` |
 | `add_action_item` | `incident_id`, `value` | Add a recommended action (free text, max 5 per incident) |
+| `link_incidents` | `incident_id`, `target_id` | Declare that `incident_id` is a symptom caused by `target_id` |
 | `submit` | — | Submit all triage decisions and end the episode |
 
 ### Example Action
@@ -90,8 +101,20 @@ Five simultaneous incidents including cascading failures and red herrings:
 - Failed deployment rollback
 - Alert storm caused by Redis failure (downstream effect, not root cause)
 
-**Expected difficulty**: Challenging — the agent must identify that the alert storm (INC-009) is a downstream symptom of the Redis failure (INC-006), not an independent incident. Requires root cause analysis across related incidents.  
+**Expected difficulty**: Challenging — the agent must identify that the alert storm (INC-009) is a downstream symptom of the Redis failure (INC-006), not an independent incident. Requires root cause analysis across related incidents. Use `diagnose` and `link_incidents` for bonus points.  
 **Max steps**: 50
+
+### Task 4: Expert — Complex Infrastructure Crisis
+
+Eight simultaneous incidents during a major infrastructure crisis:
+- OOMKilled pods (root cause) + HPA thrashing (cascade)
+- Redis node failure (root cause) + Alert storm (cascade)
+- Network partition (root cause) + CDN cache stampede (cascade)
+- JWT authentication failures
+- Kafka consumer lag (red herring — looks like infra, actually app bug)
+
+**Expected difficulty**: Very challenging — 3 hidden dependency chains, red herring incidents with misleading symptoms, **escalation mechanics** (untriaged incidents worsen over time), and 8 incidents requiring careful prioritization. Agents must use `diagnose` to uncover root causes and `link_incidents` to map the cascade.  
+**Max steps**: 80
 
 ## Reward Function
 
@@ -106,13 +129,17 @@ Five simultaneous incidents including cascading failures and red herrings:
 ### Final score (0.0–1.0) on submit
 | Component | Weight |
 |-----------|--------|
-| Severity correctness | 30% |
-| Category correctness | 25% |
-| Team assignment | 25% |
-| Action item quality | 15% |
+| Severity correctness | 25% |
+| Category correctness | 20% |
+| Team assignment | 20% |
+| Action item quality | 10% |
+| Dependency identification | 10% |
+| Diagnosis depth | 10% |
 | Efficiency (fewer steps) | 5% |
 
-Severity grading: exact match = 100%, off by one level = 50%, off by two+ = 0%.
+Severity grading: exact match = 100%, off by one level = 50%, off by two+ = 0%.  
+Dependency grading: credit for each correctly linked incident pair.  
+Diagnosis grading: credit for using `diagnose` on incidents with complex root causes.
 
 ## Setup & Usage
 
@@ -178,12 +205,13 @@ openenv validate
 
 | Task | Score | Steps |
 |------|-------|-------|
-| easy | ~0.85 | 6–8 |
-| medium | ~0.70 | 15–20 |
-| hard | ~0.55 | 25–35 |
-| **average** | **~0.70** | — |
+| easy | ~0.90 | 6–8 |
+| medium | ~0.75 | 15–20 |
+| hard | ~0.76 | 24–30 |
+| expert | ~0.65 | 50–70 |
+| **average** | **~0.76** | — |
 
-*Scores may vary depending on the model used.*
+*Scores with gpt-4o-mini. Better models will score higher.*
 
 ## Project Structure
 
@@ -194,8 +222,9 @@ incident-triage-env/
 ├── client.py               # EnvClient subclass for remote connection
 ├── server/
 │   ├── __init__.py
-│   ├── incident_triage_env_environment.py  # IncidentTriageEnvironment (step/reset/state)
-│   ├── tasks.py            # 9 incidents, 3 tasks, graders (0.0–1.0)
+│   ├── incident_triage_env_environment.py  # IncidentTriageEnvironment (step/reset/state + diagnose/link/escalation)
+│   ├── incidents.py        # 20 incidents with diagnostics + dependency chains
+│   ├── tasks.py            # 4 tasks (easy/medium/hard/expert), 7-dimension grading
 │   ├── app.py              # FastAPI app via openenv create_app()
 │   ├── Dockerfile          # Container definition
 │   └── requirements.txt    # Server dependencies

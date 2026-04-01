@@ -8,10 +8,12 @@ from openenv.core.env_server.types import Action, Observation, State
 AVAILABLE_COMMANDS = [
     "view_queue",
     "inspect",
+    "diagnose",
     "set_severity",
     "set_category",
     "assign_team",
     "add_action_item",
+    "link_incidents",
     "submit",
 ]
 
@@ -52,6 +54,10 @@ class TriageAction(Action):
     incident_id: Optional[str] = Field(
         default=None,
         description="Incident ID (e.g. 'INC-001') for commands targeting a specific incident",
+    )
+    target_id: Optional[str] = Field(
+        default=None,
+        description="Target incident ID for link_incidents command — the root cause incident",
     )
     value: Optional[str] = Field(
         default=None,

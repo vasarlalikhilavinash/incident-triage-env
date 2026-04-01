@@ -1,9 +1,16 @@
-"""Incident Triage Environment — server-side implementation."""
+"""Incident Triage Environment — server-side implementation.
+
+Features:
+  - Multi-step investigation: inspect (surface) → diagnose (root cause)
+  - Dependency chain identification: link_incidents command
+  - Escalation mechanics: untriaged incidents worsen over time
+  - 4 difficulty tiers: easy, medium, hard, expert
+"""
 
 from __future__ import annotations
 
 import copy
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Optional, Set
 from uuid import uuid4
 
 from openenv.core.env_server.interfaces import Environment
@@ -31,9 +38,9 @@ except ImportError:
     )
 
 try:
-    from .tasks import TASKS, compute_step_reward, grade_task
+    from .tasks import TASKS, compute_step_reward, get_escalation_message, grade_task
 except ImportError:
-    from server.tasks import TASKS, compute_step_reward, grade_task
+    from server.tasks import TASKS, compute_step_reward, get_escalation_message, grade_task
 
 
 class IncidentTriageEnvironment(
@@ -43,6 +50,7 @@ class IncidentTriageEnvironment(
     Production Incident Triage Environment.
 
     An AI agent acts as an on-call SRE triaging production incidents.
+    Features multi-step investigation, dependency mapping, and escalation.
     """
 
     def __init__(self) -> None:
@@ -51,6 +59,8 @@ class IncidentTriageEnvironment(
         self._task: Dict[str, Any] = TASKS["easy"]
         self._incidents: List[Dict[str, Any]] = []
         self._decisions: Dict[str, Dict[str, Any]] = {}
+        self._declared_links: Dict[str, str] = {}  # child → parent
+        self._diagnosed: Set[str] = set()  # incidents that were diagnosed
         self._step_count: int = 0
         self._done: bool = False
         self._episode_id: str = str(uuid4())
@@ -75,10 +85,30 @@ class IncidentTriageEnvironment(
         self._task = TASKS[task_id]
         self._incidents = copy.deepcopy(self._task["incidents"])
         self._decisions = {}
+        self._declared_links = {}
+        self._diagnosed = set()
         self._step_count = 0
         self._done = False
         self._episode_id = episode_id or str(uuid4())
         self._final_score = 0.0
+
+        # Build feature description based on task difficulty
+        features = []
+        if task_id in ("hard", "expert"):
+            features.append(
+                "Use 'diagnose' on incidents to reveal deep root-cause analysis."
+            )
+            features.append(
+                "Use 'link_incidents' to indicate when one incident caused another."
+            )
+        if task_id == "expert":
+            features.append(
+                "⚠ Incidents will ESCALATE if not triaged promptly — prioritize wisely!"
+            )
+
+        feature_text = "\n".join(features)
+        if feature_text:
+            feature_text = "\n\n" + feature_text
 
         return TriageObservation(
             done=False,
@@ -90,6 +120,7 @@ class IncidentTriageEnvironment(
                 f"Maximum steps: {self._task['max_steps']}.\n\n"
                 f"Available commands: {', '.join(AVAILABLE_COMMANDS)}\n"
                 f"Start by running 'view_queue' to see all incidents."
+                f"{feature_text}"
             ),
             task_id=self._task_id,
             step_number=0,
@@ -116,7 +147,11 @@ class IncidentTriageEnvironment(
         if self._step_count > self._task["max_steps"]:
             self._done = True
             self._final_score = grade_task(
-                self._task_id, self._decisions, self._step_count
+                self._task_id,
+                self._decisions,
+                self._step_count,
+                declared_links=self._declared_links,
+                diagnosed_incidents=self._diagnosed,
             )
             return self._make_observation(
                 message=(
@@ -133,10 +168,12 @@ class IncidentTriageEnvironment(
         handler = {
             "view_queue": self._cmd_view_queue,
             "inspect": self._cmd_inspect,
+            "diagnose": self._cmd_diagnose,
             "set_severity": self._cmd_set_severity,
             "set_category": self._cmd_set_category,
             "assign_team": self._cmd_assign_team,
             "add_action_item": self._cmd_add_action_item,
+            "link_incidents": self._cmd_link_incidents,
             "submit": self._cmd_submit,
         }.get(cmd)
 
@@ -152,11 +189,19 @@ class IncidentTriageEnvironment(
         obs = handler(action)
 
         # Add incremental reward for decision-making steps
-        if cmd not in ("view_queue", "inspect", "submit"):
+        if cmd not in ("view_queue", "inspect", "diagnose", "submit", "link_incidents"):
             step_reward = compute_step_reward(
                 self._task_id, self._decisions, prev_decisions
             )
             obs.reward = (obs.reward or 0.0) + step_reward
+
+        # Check for escalation warnings (hard/expert only)
+        if self._task_id in ("hard", "expert") and not self._done:
+            esc_msg = get_escalation_message(
+                self._incidents, self._decisions, self._step_count
+            )
+            if esc_msg:
+                obs.message = obs.message + "\n\n" + esc_msg
 
         return obs
 
@@ -214,8 +259,16 @@ class IncidentTriageEnvironment(
                 f"  Summary: {item['summary']}\n"
                 f"  Triage: {item['triage_status']}"
             )
+
+        # Show dependency links if any declared
+        if self._declared_links:
+            lines.append("\n--- Declared Dependencies ---")
+            for child, parent in sorted(self._declared_links.items()):
+                lines.append(f"  {child} → caused by {parent}")
+
         lines.append(
-            f"\nUse 'inspect' with an incident_id to view full details."
+            f"\nUse 'inspect' with an incident_id to view details, "
+            f"or 'diagnose' for deep root-cause analysis."
         )
 
         return self._make_observation(
@@ -269,11 +322,133 @@ class IncidentTriageEnvironment(
             for k, v in dec.items():
                 lines.append(f"  {k}: {v}")
 
+        # Hint about diagnose for complex tasks
+        if self._task_id in ("hard", "expert"):
+            lines.append(
+                f"\n💡 Tip: Use 'diagnose' on {inc_id} for deeper root-cause analysis."
+            )
+
         return self._make_observation(
             message="\n".join(lines),
             current_incident=incident,
             reward=0.0,
         )
+
+    def _cmd_diagnose(self, action: TriageAction) -> TriageObservation:
+        """Deep diagnosis — reveals root cause analysis not visible in inspect."""
+        inc_id = action.incident_id
+        if not inc_id:
+            return self._make_observation(
+                message="Error: 'diagnose' requires an incident_id. Example: incident_id='INC-001'",
+                reward=-0.01,
+            )
+
+        incident = self._find_incident(inc_id)
+        if incident is None:
+            valid_ids = [i["id"] for i in self._incidents]
+            return self._make_observation(
+                message=f"Error: Incident '{inc_id}' not found. Valid IDs: {', '.join(valid_ids)}",
+                reward=-0.01,
+            )
+
+        # Mark as diagnosed
+        self._diagnosed.add(inc_id)
+
+        diagnostics = incident.get("diagnostics", {})
+        lines = [
+            f"=== Deep Diagnosis: {incident['id']} ===",
+            f"Title: {incident['title']}",
+            "",
+            "--- Deep Investigation Logs ---",
+        ]
+
+        deep_logs = diagnostics.get("deep_logs", [])
+        if deep_logs:
+            for log_line in deep_logs:
+                lines.append(f"  {log_line}")
+        else:
+            lines.append("  (No additional logs available)")
+
+        rca = diagnostics.get("root_cause_analysis", "")
+        if rca:
+            lines.append("\n--- Root Cause Analysis ---")
+            lines.append(f"  {rca}")
+
+        heap = diagnostics.get("heap_dump")
+        if heap:
+            lines.append(f"\n--- Heap Analysis ---")
+            lines.append(f"  {heap}")
+
+        net = diagnostics.get("network_trace")
+        if net:
+            lines.append(f"\n--- Network Trace ---")
+            lines.append(f"  {net}")
+
+        # Check for dependency hints
+        caused_by = incident.get("caused_by")
+        if caused_by:
+            lines.append(
+                f"\n⚠ DEPENDENCY DETECTED: This incident appears to be caused by {caused_by}. "
+                f"Use 'link_incidents' to record this relationship."
+            )
+
+        return self._make_observation(
+            message="\n".join(lines),
+            current_incident=incident,
+            reward=0.0,
+        )
+
+    def _cmd_link_incidents(self, action: TriageAction) -> TriageObservation:
+        """Link a symptom incident to its root cause."""
+        child_id = action.incident_id
+        parent_id = action.target_id
+
+        if not child_id or not parent_id:
+            return self._make_observation(
+                message=(
+                    "Error: 'link_incidents' requires incident_id (the symptom) "
+                    "and target_id (the root cause). "
+                    "Example: {\"command\": \"link_incidents\", \"incident_id\": \"INC-009\", \"target_id\": \"INC-006\"}"
+                ),
+                reward=-0.01,
+            )
+
+        if self._find_incident(child_id) is None:
+            return self._make_observation(
+                message=f"Error: Incident '{child_id}' not found.",
+                reward=-0.01,
+            )
+        if self._find_incident(parent_id) is None:
+            return self._make_observation(
+                message=f"Error: Incident '{parent_id}' not found.",
+                reward=-0.01,
+            )
+        if child_id == parent_id:
+            return self._make_observation(
+                message="Error: Cannot link an incident to itself.",
+                reward=-0.01,
+            )
+
+        self._declared_links[child_id] = parent_id
+
+        # Check if the link is correct for immediate feedback
+        expected_deps = self._task.get("expected_deps", {})
+        if expected_deps.get(child_id) == parent_id:
+            return self._make_observation(
+                message=(
+                    f"✓ Dependency recorded: {child_id} is caused by {parent_id}. "
+                    f"This looks correct — the incidents are related."
+                ),
+                reward=0.03,
+            )
+        else:
+            return self._make_observation(
+                message=(
+                    f"Dependency recorded: {child_id} → caused by {parent_id}. "
+                    f"Noted, but verify this relationship carefully."
+                ),
+                reward=0.0,
+            )
 
     def _cmd_set_severity(self, action: TriageAction) -> TriageObservation:
         inc_id = action.incident_id
@@ -416,7 +591,11 @@ class IncidentTriageEnvironment(
 
         self._done = True
         self._final_score = grade_task(
-            self._task_id, self._decisions, self._step_count
+            self._task_id,
+            self._decisions,
+            self._step_count,
+            declared_links=self._declared_links,
+            diagnosed_incidents=self._diagnosed,
         )
 
         # Build summary
@@ -432,6 +611,21 @@ class IncidentTriageEnvironment(
                 lines.append(f"  Action Items:")
                 for item in items:
                     lines.append(f"    - {item}")
+            lines.append("")
+
+        # Show dependency identification
+        if self._declared_links:
+            lines.append("--- Dependency Links Identified ---")
+            expected_deps = self._task.get("expected_deps", {})
+            for child, parent in sorted(self._declared_links.items()):
+                correct = expected_deps.get(child) == parent
+                mark = "✓" if correct else "✗"
+                lines.append(f"  {mark} {child} → caused by {parent}")
+            lines.append("")
+
+        # Show diagnosis coverage
+        if self._diagnosed:
+            lines.append(f"--- Diagnosed Incidents: {', '.join(sorted(self._diagnosed))} ---")
             lines.append("")
 
         lines.append(f"Final Score: {self._final_score:.4f}")

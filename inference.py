@@ -39,7 +39,7 @@ TEMPERATURE: float = 0.2
 MAX_TOKENS: int = 1024
 DEBUG: bool = os.environ.get("DEBUG", "false").lower() in ("true", "1")
 
-TASK_IDS: List[str] = ["easy", "medium", "hard"]
+TASK_IDS: List[str] = ["easy", "medium", "hard", "expert"]
 
 # ---------------------------------------------------------------------------
 # System prompt
@@ -53,10 +53,12 @@ Each turn, respond with EXACTLY ONE JSON command — no other text.
 COMMANDS:
 {"command": "view_queue"}
 {"command": "inspect", "incident_id": "INC-XXX"}
+{"command": "diagnose", "incident_id": "INC-XXX"}
 {"command": "set_severity", "incident_id": "INC-XXX", "value": "VALUE"}
 {"command": "set_category", "incident_id": "INC-XXX", "value": "VALUE"}
 {"command": "assign_team", "incident_id": "INC-XXX", "value": "VALUE"}
 {"command": "add_action_item", "incident_id": "INC-XXX", "value": "free text description"}
+{"command": "link_incidents", "incident_id": "INC-CHILD", "target_id": "INC-PARENT"}
 {"command": "submit"}
 
 SEVERITY LEVELS (choose carefully based on CURRENT impact, not potential):
@@ -87,15 +89,17 @@ TEAM ASSIGNMENT (must match category):
 
 WORKFLOW — follow strictly for EACH incident:
 1. view_queue — see all incidents
-2. inspect each incident individually — read ALL logs, metrics, and recent changes
-3. For each incident, do ALL FOUR of these in order:
+2. inspect each incident — read ALL logs, metrics, and recent changes
+3. diagnose the incident — reveals deep root cause analysis and hidden dependency info
+4. For each incident, do ALL FOUR of these in order:
    a. set_severity — based on impact analysis
-   b. set_category — based on root cause from logs
+   b. set_category — based on root cause from logs AND diagnosis
    c. assign_team — must match category per the table above
    d. add_action_item — REQUIRED for every incident! Write a specific, actionable remediation that references the actual technology/service from the logs (e.g., mention the specific service name, rollback version, config to change, tool to use)
-4. Repeat steps 2-3 for ALL incidents in the queue
-5. BEFORE submitting: verify triage_decisions shows ALL incidents have severity + category + team. If any are missing, triage them first.
-6. submit ONLY when every single incident is fully triaged
+5. If diagnosis reveals one incident is caused by another, use link_incidents to record the dependency
+6. Repeat for ALL incidents in the queue
+7. BEFORE submitting: verify triage_decisions shows ALL incidents have severity + category + team. If any are missing, triage them first.
+8. submit ONLY when every single incident is fully triaged
 
 CLASSIFICATION TIPS:
 - If an incident is an alert storm or cascade of alerts caused by an upstream dependency failing, classify it as "monitoring" (the alerts are the problem, not the service itself).

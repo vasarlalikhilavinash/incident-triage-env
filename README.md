@@ -125,17 +125,17 @@ Severity grading: exact match = 100%, off by one level = 50%, off by two+ = 0%.
 
 ```bash
 # Install dependencies
-pip install -e .
+uv sync
 
 # Start the server
-uvicorn server.app:app --host 0.0.0.0 --port 8000 --reload
+uv run server
 ```
 
 ### Docker
 
 ```bash
 # Build the container
-docker build -t incident-triage-env .
+docker build -t incident-triage-env -f server/Dockerfile .
 
 # Run
 docker run -p 8000:8000 incident-triage-env
@@ -143,16 +143,18 @@ docker run -p 8000:8000 incident-triage-env
 
 ### Running the Baseline
 
-```bash
-# Set environment variables
-export API_BASE_URL="https://api.openai.com/v1"
-export MODEL_NAME="gpt-4o-mini"
-export HF_TOKEN="your-api-key"
-export ENV_URL="http://localhost:8000"
+The inference script uses the **OpenAI client** and reads credentials from environment variables:
 
-# Run inference
+```bash
+export API_BASE_URL="https://api.openai.com/v1"   # LLM API endpoint
+export MODEL_NAME="gpt-4o-mini"                    # Model identifier
+export HF_TOKEN="your-api-key"                     # API key (also reads OPENAI_API_KEY)
+export ENV_URL="http://localhost:8000"              # Environment server URL
+
 python inference.py
 ```
+
+Runtime: < 20 minutes on 2 vCPU / 8 GB RAM.
 
 ### API Endpoints
 
@@ -187,19 +189,21 @@ openenv validate
 
 ```
 incident-triage-env/
-├── incident_triage_env/    # Python package
-│   ├── __init__.py
-│   ├── models.py           # TriageAction, TriageObservation, TriageState
-│   └── client.py           # EnvClient subclass
+├── __init__.py             # Package exports
+├── models.py               # TriageAction, TriageObservation, TriageState (typed Pydantic)
+├── client.py               # EnvClient subclass for remote connection
 ├── server/
 │   ├── __init__.py
-│   ├── environment.py      # IncidentTriageEnvironment
-│   ├── tasks.py            # Task data, incidents, graders
-│   └── app.py              # FastAPI application
+│   ├── incident_triage_env_environment.py  # IncidentTriageEnvironment (step/reset/state)
+│   ├── tasks.py            # 9 incidents, 3 tasks, graders (0.0–1.0)
+│   ├── app.py              # FastAPI app via openenv create_app()
+│   ├── Dockerfile          # Container definition
+│   └── requirements.txt    # Server dependencies
+├── Dockerfile              # Root Dockerfile for HF Spaces
 ├── openenv.yaml            # OpenEnv manifest
-├── pyproject.toml           # Dependencies
-├── Dockerfile              # Container definition
-├── inference.py            # Baseline inference script
+├── pyproject.toml          # Dependencies & package config
+├── uv.lock                 # Locked dependencies
+├── inference.py            # Baseline inference script (OpenAI client)
 └── README.md               # This file
 ```
 

@@ -48,36 +48,68 @@ TASK_IDS: List[str] = ["easy", "medium", "hard"]
 SYSTEM_PROMPT = """\
 You are an expert Site Reliability Engineer (SRE) on-call, triaging production incidents.
 
-You interact with an incident triage environment using structured commands.
-Each command is a JSON object with "command", and optionally "incident_id" and "value" fields.
+Each turn, respond with EXACTLY ONE JSON command — no other text.
 
-AVAILABLE COMMANDS:
-- {"command": "view_queue"} — View all incidents in the queue
-- {"command": "inspect", "incident_id": "INC-XXX"} — View full details of a specific incident
-- {"command": "set_severity", "incident_id": "INC-XXX", "value": "P0|P1|P2|P3"} — Set severity level
-  - P0: Critical — total service outage or data loss
-  - P1: Major — significant impact, partial outage, revenue loss
-  - P2: Moderate — degraded service but workarounds available
-  - P3: Low — minor issue, no immediate user impact
-- {"command": "set_category", "incident_id": "INC-XXX", "value": "CATEGORY"} — Set category
-  Categories: database, api, infrastructure, security, application, deployment, monitoring, network
-- {"command": "assign_team", "incident_id": "INC-XXX", "value": "TEAM"} — Assign to response team
-  Teams: database-team, platform-team, infra-team, security-team, backend-team, frontend-team, devops-team, sre-team
-- {"command": "add_action_item", "incident_id": "INC-XXX", "value": "description"} — Add recommended action
-- {"command": "submit"} — Submit all triage decisions (ends the episode)
+COMMANDS:
+{"command": "view_queue"}
+{"command": "inspect", "incident_id": "INC-XXX"}
+{"command": "set_severity", "incident_id": "INC-XXX", "value": "VALUE"}
+{"command": "set_category", "incident_id": "INC-XXX", "value": "VALUE"}
+{"command": "assign_team", "incident_id": "INC-XXX", "value": "VALUE"}
+{"command": "add_action_item", "incident_id": "INC-XXX", "value": "free text description"}
+{"command": "submit"}
 
-WORKFLOW:
-1. First, view_queue to see all incidents
-2. Inspect each incident to understand its details (logs, metrics, recent changes)
-3. For each incident, set severity, category, and team
-4. Add at least one action item per incident describing the recommended immediate response
-5. Once all incidents are triaged, submit
+SEVERITY LEVELS (choose carefully based on CURRENT impact, not potential):
+- P0: Complete outage NOW — total service down, active data loss, zero availability
+- P1: Major impact NOW — significant user-facing failures, revenue actively being lost, multiple replicas down, data store nodes failing, connection pools exhausted causing transaction failures
+- P2: Degraded but functional — service still works but slower or with workarounds, cert expiring in days (not yet expired), failed deployments with some replicas still running, DDoS being partially mitigated, elevated latency
+- P3: Minor or no user impact RIGHT NOW — disk filling slowly with hours of runway, alert storms that are SYMPTOMS of other incidents (not root cause), cosmetic issues, stale logrotate
 
-IMPORTANT:
-- Always inspect incidents before making decisions
-- Consider cascading failures — some incidents may be symptoms of others
-- Be efficient — use as few steps as possible
-- Respond with ONLY a single valid JSON command per turn, no additional text
+CATEGORY CLASSIFICATION (read logs carefully):
+- database: ANY data store issue — PostgreSQL, MySQL, Redis, Memcached, Elasticsearch, etc. Redis IS a database.
+- api: API gateway issues, upstream service timeouts, HTTP error spikes, circuit breaker trips
+- infrastructure: Physical/VM/node hardware, disk, CPU, network infra failures
+- security: DDoS, traffic anomalies, unauthorized access, certificate issues, WAF alerts
+- application: App-level bugs, OOM kills, memory leaks, crashes caused by code changes/deployments to app services
+- deployment: Failed deploys, stuck rollbacks, image pull failures, ArgoCD/CI-CD pipeline issues
+- monitoring: Alert storms, alert correlation issues, cascading alert noise caused by UPSTREAM dependency failures (not the root cause itself)
+- network: DNS, routing, BGP, load balancer, connectivity issues
+
+TEAM ASSIGNMENT (must match category):
+- database → database-team
+- api → platform-team
+- infrastructure → infra-team
+- security → security-team
+- application → backend-team
+- deployment → platform-team
+- monitoring → sre-team
+- network → infra-team
+
+WORKFLOW — follow strictly for EACH incident:
+1. view_queue — see all incidents
+2. inspect each incident individually — read ALL logs, metrics, and recent changes
+3. For each incident, do ALL FOUR of these in order:
+   a. set_severity — based on impact analysis
+   b. set_category — based on root cause from logs
+   c. assign_team — must match category per the table above
+   d. add_action_item — REQUIRED for every incident! Write a specific, actionable remediation that references the actual technology/service from the logs (e.g., mention the specific service name, rollback version, config to change, tool to use)
+4. Repeat steps 2-3 for ALL incidents in the queue
+5. BEFORE submitting: verify triage_decisions shows ALL incidents have severity + category + team. If any are missing, triage them first.
+6. submit ONLY when every single incident is fully triaged
+
+CLASSIFICATION TIPS:
+- If an incident is an alert storm or cascade of alerts caused by an upstream dependency failing, classify it as "monitoring" (the alerts are the problem, not the service itself).
+- Redis/Memcached node failures are "database" — they are data stores even though they run on infrastructure.
+- OOMKilled pods due to a recent code deployment with memory issues → "application" (the code caused it, not the infrastructure).
+- Failed image pulls during rollback → "deployment" (CI/CD pipeline issue).
+- DDoS or anomalous traffic patterns → "security" even if they affect APIs.
+- Certificate expiry → "security".
+
+CRITICAL RULES:
+- Use EXACTLY the values listed above (case-sensitive).
+- NEVER submit until ALL incidents have severity, category, and team. Count them.
+- If triage_decisions shows any incident with missing fields, triage it before submitting.
+- Respond with ONLY the JSON command, nothing else.
 """
 
 
@@ -209,25 +241,23 @@ def run_task(env: EnvSession, task_id: str) -> float:
 
     print(f"  Initial: {obs.get('message', '')[:120]}...")
 
-    messages: List[Dict[str, Any]] = [
+    conversation: List[Dict[str, Any]] = [
         {"role": "system", "content": SYSTEM_PROMPT},
     ]
-    history: List[str] = []
+
+    # Add initial observation as first user message
+    conversation.append({"role": "user", "content": _format_observation(obs, step=0)})
 
     for step in range(1, MAX_STEPS + 1):
         if done:
             break
 
-        # Build the user prompt with current observation
-        user_prompt = _build_user_prompt(obs, step, history)
-        messages_for_llm = [
-            messages[0],  # system prompt
-            {"role": "user", "content": user_prompt},
-        ]
-
-        # Call LLM
-        response_text = call_llm(messages_for_llm)
+        # Call LLM with full conversation
+        response_text = call_llm(conversation)
         action = parse_action(response_text)
+
+        # Add assistant response to conversation
+        conversation.append({"role": "assistant", "content": json.dumps(action)})
 
         if DEBUG:
             print(f"  Step {step}: {json.dumps(action)}")
@@ -243,14 +273,14 @@ def run_task(env: EnvSession, task_id: str) -> float:
         reward = result.get("reward", 0.0) or 0.0
         done = result.get("done", False)
 
-        # Track history for context
-        cmd = action.get("command", "?")
-        msg_preview = obs.get("message", "")[:80]
-        history_line = f"Step {step}: {cmd} -> reward={reward:+.4f}"
-        if action.get("incident_id"):
-            history_line += f" (incident={action['incident_id']})"
-        history.append(history_line)
+        # Add observation as next user message
+        conversation.append({"role": "user", "content": _format_observation(obs, step=step)})
 
+        # Keep conversation manageable — trim middle if too long
+        if len(conversation) > 30:
+            conversation = conversation[:3] + conversation[-20:]
+
+        cmd = action.get("command", "?")
         if not DEBUG:
             print(f"  Step {step}: {cmd:20s} reward={reward:+.4f}  {'DONE' if done else ''}")
 
@@ -263,27 +293,46 @@ def run_task(env: EnvSession, task_id: str) -> float:
     return final_score
 
 
-def _build_user_prompt(obs: Dict[str, Any], step: int, history: List[str]) -> str:
-    """Build the user prompt from the current observation."""
-    parts = [
-        f"Step {step} of {obs.get('max_steps', 50)}. Task: {obs.get('task_id', '?')}",
-        "",
-        "Current observation:",
-        obs.get("message", "(no message)"),
-    ]
+def _format_observation(obs: Dict[str, Any], step: int) -> str:
+    """Format observation into a concise user message."""
+    parts = []
+
+    msg = obs.get("message", "")
+    if msg:
+        parts.append(msg)
 
     decisions = obs.get("triage_decisions", {})
     if decisions:
-        parts.append("\nYour current triage decisions:")
-        for inc_id, dec in decisions.items():
-            parts.append(f"  {inc_id}: {json.dumps(dec)}")
+        parts.append("\nCurrent triage decisions:")
+        incomplete_count = 0
+        complete_count = 0
+        no_actions = []
+        for inc_id, dec in sorted(decisions.items()):
+            missing = []
+            if not dec.get("severity"): missing.append("severity")
+            if not dec.get("category"): missing.append("category")
+            if not dec.get("team"): missing.append("team")
+            has_actions = bool(dec.get("action_items"))
+            status = json.dumps(dec)
+            if missing:
+                status += f"  *** MISSING: {', '.join(missing)} ***"
+                incomplete_count += 1
+            else:
+                complete_count += 1
+            if not has_actions:
+                no_actions.append(inc_id)
+            parts.append(f"  {inc_id}: {status}")
+        total = complete_count + incomplete_count
+        if incomplete_count > 0:
+            parts.append(f"\n>> {incomplete_count}/{total} incidents INCOMPLETE — do NOT submit yet! <<")
+        elif no_actions:
+            parts.append(f"\n>> All triaged but {', '.join(no_actions)} still need action items! Add them before submitting. <<")
+        else:
+            parts.append(f"\n>> All {total} incidents fully triaged — ready to submit. <<")
 
-    if history:
-        parts.append(f"\nRecent actions ({len(history)} total):")
-        for line in history[-5:]:
-            parts.append(f"  {line}")
-
-    parts.append("\nRespond with a single JSON command:")
+    step_num = obs.get("step_number", step)
+    max_steps = obs.get("max_steps", 50)
+    parts.append(f"\n[Step {step_num}/{max_steps}] Respond with ONE JSON command:")
 
     return "\n".join(parts)
 

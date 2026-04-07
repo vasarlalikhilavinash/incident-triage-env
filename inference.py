@@ -1,13 +1,14 @@
 #!/usr/bin/env python3
 """Baseline inference script for the Incident Triage Environment.
 
-Uses the OpenAI API client to run a model against the environment
-across all four tasks (easy, medium, hard, expert) and reports scores.
+Uses an LLM (via the OpenAI-compatible API) inside a persistent WebSocket
+session to run a full agent loop across all four tasks and report scores.
 
 Required environment variables:
-    API_BASE_URL   - The API endpoint for the LLM
-    MODEL_NAME     - The model identifier to use for inference
-    HF_TOKEN       - Your HuggingFace / API key (also reads OPENAI_API_KEY)
+    API_BASE_URL   - LLM endpoint (default: https://api.openai.com/v1)
+    MODEL_NAME     - Model identifier  (default: gpt-4o-mini)
+    HF_TOKEN       - API key (also reads OPENAI_API_KEY)
+    ENV_URL        - Environment server URL (default: http://localhost:8000)
 """
 
 from __future__ import annotations
@@ -16,20 +17,20 @@ import json
 import os
 import re
 import sys
+import time
 from typing import Any, Dict, List, Optional
-from urllib import error, request
 
+import websocket  # websocket-client (sync)
 from openai import OpenAI
 
 # ---------------------------------------------------------------------------
-# Configuration from environment variables
+# Configuration
 # ---------------------------------------------------------------------------
 
 API_BASE_URL: str = os.environ.get("API_BASE_URL", "https://api.openai.com/v1")
 MODEL_NAME: str = os.environ.get("MODEL_NAME", "gpt-4o-mini")
 HF_TOKEN: str = os.environ.get("HF_TOKEN", os.environ.get("OPENAI_API_KEY", ""))
 
-# Environment server URL — defaults to local Docker for testing
 ENV_URL: str = os.environ.get("ENV_URL", "http://localhost:8000")
 
 MAX_STEPS: int = 50
@@ -39,8 +40,12 @@ DEBUG: bool = os.environ.get("DEBUG", "false").lower() in ("true", "1")
 
 TASK_IDS: List[str] = ["easy", "medium", "hard", "expert"]
 
+# Connection retry settings
+_WS_CONNECT_RETRIES: int = 5
+_WS_CONNECT_DELAY_S: float = 3.0
+
 # ---------------------------------------------------------------------------
-# LLM client — initialised lazily so missing API key doesn't crash at import
+# LLM client — created lazily so import-time failures are impossible
 # ---------------------------------------------------------------------------
 
 _llm_client: Optional[OpenAI] = None
@@ -107,19 +112,19 @@ WORKFLOW — follow strictly for EACH incident:
    a. set_severity — based on impact analysis
    b. set_category — based on root cause from logs AND diagnosis
    c. assign_team — must match category per the table above
-   d. add_action_item — REQUIRED for every incident! Write a specific, actionable remediation that references the actual technology/service from the logs (e.g., mention the specific service name, rollback version, config to change, tool to use)
+   d. add_action_item — REQUIRED for every incident! Write a specific, actionable remediation that references the actual technology/service from the logs
 5. If diagnosis reveals one incident is caused by another, use link_incidents to record the dependency
 6. Repeat for ALL incidents in the queue
 7. BEFORE submitting: verify triage_decisions shows ALL incidents have severity + category + team. If any are missing, triage them first.
 8. submit ONLY when every single incident is fully triaged
 
 CLASSIFICATION TIPS:
-- If an incident is an alert storm or cascade of alerts caused by an upstream dependency failing, classify it as "monitoring" (the alerts are the problem, not the service itself).
-- Redis/Memcached node failures are "database" — they are data stores even though they run on infrastructure.
-- OOMKilled pods due to a recent code deployment with memory issues → "application" (the code caused it, not the infrastructure).
-- Failed image pulls during rollback → "deployment" (CI/CD pipeline issue).
-- DDoS or anomalous traffic patterns → "security" even if they affect APIs.
-- Certificate expiry → "security".
+- Alert storms caused by an upstream dependency failing → classify as "monitoring"
+- Redis/Memcached node failures → "database"
+- OOMKilled pods due to a recent code deployment → "application"
+- Failed image pulls during rollback → "deployment"
+- DDoS or anomalous traffic patterns → "security"
+- Certificate expiry → "security"
 
 CRITICAL RULES:
 - Use EXACTLY the values listed above (case-sensitive).
@@ -134,7 +139,7 @@ CRITICAL RULES:
 # ---------------------------------------------------------------------------
 
 def call_llm(messages: List[Dict[str, Any]]) -> str:
-    """Call the LLM and return the response text."""
+    """Call the LLM and return the response text. Never raises."""
     try:
         completion = _get_client().chat.completions.create(
             model=MODEL_NAME,
@@ -151,144 +156,237 @@ def call_llm(messages: List[Dict[str, Any]]) -> str:
 
 
 def parse_action(response: str) -> Dict[str, Any]:
-    """Extract a JSON action from the LLM response."""
+    """Extract a JSON action dict from the LLM response. Never raises."""
     text = response.strip()
+
+    # Strip markdown code fences
     if text.startswith("```"):
         text = re.sub(r"^```(?:json)?\s*", "", text)
         text = re.sub(r"\s*```$", "", text)
         text = text.strip()
 
+    # Direct JSON parse
     try:
         action = json.loads(text)
         if isinstance(action, dict) and "command" in action:
             return action
-    except json.JSONDecodeError:
+    except (json.JSONDecodeError, ValueError):
         pass
 
+    # Find embedded JSON object with a "command" key
     match = re.search(r'\{[^{}]*"command"\s*:\s*"[^"]+?"[^{}]*\}', text)
     if match:
         try:
-            return json.loads(match.group())
-        except json.JSONDecodeError:
+            action = json.loads(match.group())
+            if isinstance(action, dict) and "command" in action:
+                return action
+        except (json.JSONDecodeError, ValueError):
             pass
 
-    if "view_queue" in text.lower():
-        return {"command": "view_queue"}
+    # Keyword fallbacks
     if "submit" in text.lower():
         return {"command": "submit"}
 
     return {"command": "view_queue"}
 
 
-
 # ---------------------------------------------------------------------------
-# HTTP communication with the environment
+# WebSocket session with the environment
 # ---------------------------------------------------------------------------
 
 class EnvSession:
-    """Manages an HTTP session with the environment."""
+    """Manages a persistent WebSocket session with the environment server."""
 
     def __init__(self, base_url: str) -> None:
-        self._base_url = base_url.rstrip("/")
-        self._connected = False
+        ws_url = base_url.replace("https://", "wss://").replace("http://", "ws://")
+        self._ws_url = f"{ws_url.rstrip('/')}/ws"
+        self._ws: Optional[websocket.WebSocket] = None
 
     def connect(self) -> None:
-        self._connected = True
+        """Open the WebSocket connection, retrying if the server is still starting."""
+        last_exc: Exception = RuntimeError("connect never attempted")
+        for attempt in range(1, _WS_CONNECT_RETRIES + 1):
+            try:
+                self._ws = websocket.create_connection(self._ws_url, timeout=30)
+                return
+            except Exception as exc:
+                last_exc = exc
+                if attempt < _WS_CONNECT_RETRIES:
+                    if DEBUG:
+                        print(
+                            f"  [DEBUG] WS connect attempt {attempt} failed: {exc}. "
+                            f"Retrying in {_WS_CONNECT_DELAY_S}s…",
+                            flush=True,
+                        )
+                    time.sleep(_WS_CONNECT_DELAY_S)
+        raise RuntimeError(
+            f"Could not connect to {self._ws_url} "
+            f"after {_WS_CONNECT_RETRIES} attempts: {last_exc}"
+        )
 
     def close(self) -> None:
-        self._connected = False
-
-    def _request_json(
-        self,
-        method: str,
-        path: str,
-        payload: Optional[Dict[str, Any]] = None,
-    ) -> Dict[str, Any]:
-        data = None
-        headers = {"Accept": "application/json"}
-        if payload is not None:
-            data = json.dumps(payload).encode("utf-8")
-            headers["Content-Type"] = "application/json"
-
-        req = request.Request(f"{self._base_url}{path}", data=data, headers=headers, method=method)
+        """Close the WebSocket session gracefully. Never raises."""
+        ws = self._ws
+        self._ws = None
+        if ws is None:
+            return
         try:
-            with request.urlopen(req, timeout=30) as response:
-                raw = response.read().decode("utf-8")
-        except error.HTTPError as exc:
-            body = exc.read().decode("utf-8", errors="replace")
-            raise RuntimeError(f"HTTP {exc.code} on {path}: {body}") from exc
-        except error.URLError as exc:
-            raise RuntimeError(f"Unable to reach environment at {self._base_url}: {exc.reason}") from exc
+            ws.send(json.dumps({"type": "close"}))
+        except Exception:
+            pass
+        try:
+            ws.close()
+        except Exception:
+            pass
+
+    def _send_recv(self, msg: Dict[str, Any]) -> Dict[str, Any]:
+        """Send a WS message and return the parsed data payload. Raises on errors."""
+        if self._ws is None:
+            raise RuntimeError("WebSocket not connected — call connect() first")
+
+        try:
+            self._ws.send(json.dumps(msg))
+            raw = self._ws.recv()
+        except websocket.WebSocketConnectionClosedException as exc:
+            raise RuntimeError("WebSocket connection closed unexpectedly") from exc
+        except websocket.WebSocketTimeoutException as exc:
+            raise RuntimeError("WebSocket receive timed out") from exc
 
         if not raw:
-            return {}
+            raise RuntimeError("Empty response from environment server")
 
         try:
-            payload_obj = json.loads(raw)
-        except json.JSONDecodeError as exc:
-            raise RuntimeError(f"Invalid JSON from {path}: {raw[:200]}") from exc
+            response = json.loads(raw)
+        except (json.JSONDecodeError, ValueError) as exc:
+            raise RuntimeError(f"Invalid JSON from server: {raw[:200]}") from exc
 
-        if isinstance(payload_obj, dict) and payload_obj.get("type") == "error":
-            message = payload_obj.get("data", {}).get("message", "unknown error")
-            raise RuntimeError(message)
+        if not isinstance(response, dict):
+            raise RuntimeError(f"Unexpected response type: {type(response).__name__}")
 
-        if isinstance(payload_obj, dict) and "data" in payload_obj and isinstance(payload_obj["data"], dict):
-            return payload_obj["data"]
+        if response.get("type") == "error":
+            data = response.get("data")
+            msg_text = (data.get("message", "") if isinstance(data, dict) else "") or str(response)
+            raise RuntimeError(f"Server error: {msg_text}")
 
-        if isinstance(payload_obj, dict):
-            return payload_obj
+        data = response.get("data")
+        if not isinstance(data, dict):
+            raise RuntimeError(
+                f"Unexpected response shape — expected 'data' dict, got: {response}"
+            )
 
-        raise RuntimeError(f"Unexpected response payload from {path}: {type(payload_obj).__name__}")
+        return data
 
     def reset(self, task_id: str = "easy") -> Dict[str, Any]:
-        """Reset the environment and return the initial observation."""
-        if not self._connected:
-            self.connect()
-        payload = self._request_json("POST", "/reset", {"task_id": task_id})
-        return self._normalize_result(payload)
+        """Reset the environment for a given task. Returns the initial state dict."""
+        return self._send_recv({"type": "reset", "data": {"task_id": task_id}})
 
     def step(self, action: Dict[str, Any]) -> Dict[str, Any]:
-        """Send an action and return the result."""
-        if not self._connected:
-            self.connect()
-        payload = self._request_json("POST", "/step", action)
-        return self._normalize_result(payload)
-
-    def _normalize_result(self, payload: Dict[str, Any]) -> Dict[str, Any]:
-        """Normalize OpenEnv HTTP payloads into a step-like response shape."""
-        if "observation" in payload:
-            return payload
-
-        return {
-            "observation": payload,
-            "reward": payload.get("reward", 0.0),
-            "done": payload.get("done", False),
-        }
+        """Execute one action. Returns the resulting state dict."""
+        return self._send_recv({"type": "step", "data": action})
 
 
 # ---------------------------------------------------------------------------
-# Main inference loop
+# Observation formatter
+# ---------------------------------------------------------------------------
+
+def _format_observation(obs: Dict[str, Any], step: int) -> str:
+    """Format the env observation into a concise LLM user message."""
+    if not isinstance(obs, dict):
+        obs = {}
+
+    parts: List[str] = []
+
+    msg = obs.get("message") or ""
+    if msg:
+        parts.append(str(msg))
+
+    decisions: Dict[str, Any] = obs.get("triage_decisions") or {}
+    if decisions:
+        parts.append("\nCurrent triage decisions:")
+        incomplete = 0
+        complete = 0
+        no_actions: List[str] = []
+
+        for inc_id, dec in sorted(decisions.items()):
+            if not isinstance(dec, dict):
+                continue
+            missing: List[str] = []
+            if not dec.get("severity"):
+                missing.append("severity")
+            if not dec.get("category"):
+                missing.append("category")
+            if not dec.get("team"):
+                missing.append("team")
+
+            status = json.dumps(dec)
+            if missing:
+                status += f"  *** MISSING: {', '.join(missing)} ***"
+                incomplete += 1
+            else:
+                complete += 1
+
+            if not dec.get("action_items"):
+                no_actions.append(inc_id)
+
+            parts.append(f"  {inc_id}: {status}")
+
+        total = complete + incomplete
+        if incomplete > 0:
+            parts.append(
+                f"\n>> {incomplete}/{total} incidents INCOMPLETE — do NOT submit yet! <<"
+            )
+        elif no_actions:
+            parts.append(
+                f"\n>> All triaged but {', '.join(no_actions)} still need action items! "
+                "Add them before submitting. <<"
+            )
+        else:
+            parts.append(f"\n>> All {total} incidents fully triaged — ready to submit. <<")
+
+    try:
+        step_num = int(obs.get("step_number") or step)
+    except (TypeError, ValueError):
+        step_num = step
+    try:
+        max_s = int(obs.get("max_steps") or MAX_STEPS)
+    except (TypeError, ValueError):
+        max_s = MAX_STEPS
+
+    parts.append(f"\n[Step {step_num}/{max_s}] Respond with ONE JSON command:")
+
+    return "\n".join(parts)
+
+
+# ---------------------------------------------------------------------------
+# Per-task inference loop
 # ---------------------------------------------------------------------------
 
 def run_task(env: EnvSession, task_id: str) -> float:
-    """Run inference on a single task and return the score."""
+    """Run a full agent episode on one task and return the final score."""
     print(f"\n{'='*60}")
     print(f"Task: {task_id}")
     print(f"{'='*60}")
 
     result = env.reset(task_id=task_id)
-    obs = result.get("observation", {})
-    reward = result.get("reward", 0.0)
-    done = result.get("done", False)
-    max_steps = max(int(obs.get("max_steps", MAX_STEPS) or MAX_STEPS), MAX_STEPS)
 
-    print(f"  Initial: {obs.get('message', '')[:120]}...")
+    # WS reset response shape: {"observation": {...}, "reward": float|None, "done": bool}
+    obs: Dict[str, Any] = result.get("observation") or {}
+    reward: float = float(result.get("reward") or 0.0)
+    done: bool = bool(result.get("done", False))
+
+    try:
+        max_steps = max(int(obs.get("max_steps") or MAX_STEPS), MAX_STEPS)
+    except (TypeError, ValueError):
+        max_steps = MAX_STEPS
+
+    print(f"  Initial: {str(obs.get('message', ''))[:120]}…")
 
     conversation: List[Dict[str, Any]] = [
         {"role": "system", "content": SYSTEM_PROMPT},
         {"role": "user", "content": _format_observation(obs, step=0)},
     ]
 
+    step = 0
     for step in range(1, max_steps + 1):
         if done:
             break
@@ -299,21 +397,21 @@ def run_task(env: EnvSession, task_id: str) -> float:
         conversation.append({"role": "assistant", "content": json.dumps(action)})
 
         if DEBUG:
-            print(f"  Step {step}: {json.dumps(action)}")
+            print(f"  Step {step}: {json.dumps(action)}", flush=True)
 
         try:
             result = env.step(action)
         except Exception as exc:
-            print(f"  Step {step} ERROR: {exc}")
+            print(f"  Step {step} ERROR: {exc}", flush=True)
             break
 
-        obs = result.get("observation", {})
-        reward = result.get("reward", 0.0) or 0.0
-        done = result.get("done", False)
+        obs = result.get("observation") or {}
+        reward = float(result.get("reward") or 0.0)
+        done = bool(result.get("done", False))
 
         conversation.append({"role": "user", "content": _format_observation(obs, step=step)})
 
-        # Keep conversation manageable — trim middle if too long
+        # Trim conversation: keep system + first 2 turns + last 20 turns
         if len(conversation) > 30:
             conversation = conversation[:3] + conversation[-20:]
 
@@ -326,87 +424,45 @@ def run_task(env: EnvSession, task_id: str) -> float:
 
     final_score = reward if done else 0.0
     print(f"\n  Final Score: {final_score:.4f}")
-    print(f"  Steps Used: {step}")
+    print(f"  Steps Used:  {step}")
     return final_score
 
 
-def _format_observation(obs: Dict[str, Any], step: int) -> str:
-    """Format observation into a concise user message."""
-    parts = []
-
-    msg = obs.get("message", "")
-    if msg:
-        parts.append(msg)
-
-    decisions = obs.get("triage_decisions", {})
-    if decisions:
-        parts.append("\nCurrent triage decisions:")
-        incomplete_count = 0
-        complete_count = 0
-        no_actions = []
-        for inc_id, dec in sorted(decisions.items()):
-            missing = []
-            if not dec.get("severity"): missing.append("severity")
-            if not dec.get("category"): missing.append("category")
-            if not dec.get("team"): missing.append("team")
-            has_actions = bool(dec.get("action_items"))
-            status = json.dumps(dec)
-            if missing:
-                status += f"  *** MISSING: {', '.join(missing)} ***"
-                incomplete_count += 1
-            else:
-                complete_count += 1
-            if not has_actions:
-                no_actions.append(inc_id)
-            parts.append(f"  {inc_id}: {status}")
-        total = complete_count + incomplete_count
-        if incomplete_count > 0:
-            parts.append(f"\n>> {incomplete_count}/{total} incidents INCOMPLETE — do NOT submit yet! <<")
-        elif no_actions:
-            parts.append(f"\n>> All triaged but {', '.join(no_actions)} still need action items! Add them before submitting. <<")
-        else:
-            parts.append(f"\n>> All {total} incidents fully triaged — ready to submit. <<")
-
-    step_num = obs.get("step_number", step)
-    max_steps = obs.get("max_steps", 50)
-    parts.append(f"\n[Step {step_num}/{max_steps}] Respond with ONE JSON command:")
-
-    return "\n".join(parts)
-
+# ---------------------------------------------------------------------------
+# Entry point
+# ---------------------------------------------------------------------------
 
 def main() -> None:
-    """Run baseline inference across all tasks."""
+    """Run baseline inference across all tasks and print a summary."""
     print("=" * 60)
     print("Incident Triage Environment — Baseline Inference")
     print("=" * 60)
-    print(f"LLM: {MODEL_NAME} @ {API_BASE_URL}")
+    print(f"LLM:         {MODEL_NAME} @ {API_BASE_URL}")
     print(f"Environment: {ENV_URL}")
     print()
 
     if not HF_TOKEN:
-        print("WARNING: No API key found. Set HF_TOKEN or OPENAI_API_KEY.")
+        print("ERROR: No API key found. Set HF_TOKEN or OPENAI_API_KEY.", file=sys.stderr)
         sys.exit(1)
 
     scores: Dict[str, float] = {}
-    env = EnvSession(ENV_URL)
 
     for task_id in TASK_IDS:
+        env = EnvSession(ENV_URL)
         try:
             env.connect()
-            score = run_task(env, task_id)
-            scores[task_id] = score
+            scores[task_id] = run_task(env, task_id)
         except Exception as exc:
-            print(f"\n  ERROR on task '{task_id}': {exc}")
+            print(f"\n  ERROR on task '{task_id}': {exc}", flush=True)
             scores[task_id] = 0.0
         finally:
             env.close()
 
-    # Summary
     print("\n" + "=" * 60)
     print("RESULTS SUMMARY")
     print("=" * 60)
-    for task_id, score in scores.items():
-        print(f"  {task_id:10s}: {score:.4f}")
+    for tid, score in scores.items():
+        print(f"  {tid:10s}: {score:.4f}")
     avg = sum(scores.values()) / len(scores) if scores else 0.0
     print(f"  {'average':10s}: {avg:.4f}")
     print("=" * 60)

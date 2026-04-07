@@ -43,6 +43,9 @@ DEBUG: bool = os.environ.get("DEBUG", "false").lower() in ("true", "1")
 
 TASK_IDS: List[str] = ["easy", "medium", "hard", "expert"]
 
+MIN_VALIDATOR_SCORE: float = 0.0001
+MAX_VALIDATOR_SCORE: float = 0.9999
+
 # Connection retry settings
 _WS_CONNECT_RETRIES: int = 5
 _WS_CONNECT_DELAY_S: float = 3.0
@@ -191,6 +194,11 @@ def parse_action(response: str) -> Dict[str, Any]:
         return {"command": "submit"}
 
     return {"command": "view_queue"}
+
+
+def normalize_task_score(score: float) -> float:
+    """Clamp task scores into the validator's required open interval."""
+    return max(MIN_VALIDATOR_SCORE, min(float(score), MAX_VALIDATOR_SCORE))
 
 
 # ---------------------------------------------------------------------------
@@ -418,7 +426,7 @@ def run_task(env: EnvSession, task_id: str) -> float:
         if done:
             break
 
-    final_score = reward if done else 0.0
+    final_score = normalize_task_score(reward if done else 0.0)
     print(f"[END] task_id={task_id} score={final_score:.4f} steps={step}", flush=True)
     return final_score
 
@@ -443,8 +451,12 @@ def main() -> None:
             env.connect()
             scores[task_id] = run_task(env, task_id)
         except Exception as exc:
-            print(f"[END] task_id={task_id} score=0.0000 error={exc}", flush=True)
-            scores[task_id] = 0.0
+            fallback_score = normalize_task_score(0.0)
+            print(
+                f"[END] task_id={task_id} score={fallback_score:.4f} error={exc}",
+                flush=True,
+            )
+            scores[task_id] = fallback_score
         finally:
             env.close()
 

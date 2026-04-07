@@ -168,20 +168,17 @@ docker build -t incident-triage-env -f server/Dockerfile .
 docker run -p 8000:8000 incident-triage-env
 ```
 
-### Running the Baseline
+### Running Inference
 
-The inference script uses the **OpenAI client** and reads credentials from environment variables:
+The repository ships a self-contained deterministic inference client. It talks to the environment over the documented HTTP endpoints and does not require `openai` or `websocket-client`.
 
 ```bash
-export API_BASE_URL="https://api.openai.com/v1"   # LLM API endpoint
-export MODEL_NAME="gpt-4o-mini"                    # Model identifier
-export HF_TOKEN="your-api-key"                     # API key (also reads OPENAI_API_KEY)
-export ENV_URL="http://localhost:8000"              # Environment server URL
+export ENV_URL="http://localhost:8000"
 
 python inference.py
 ```
 
-Runtime: < 20 minutes on 2 vCPU / 8 GB RAM.
+Runtime: typically a few minutes on 2 vCPU / 8 GB RAM.
 
 ### API Endpoints
 
@@ -192,7 +189,7 @@ Runtime: < 20 minutes on 2 vCPU / 8 GB RAM.
 | `/step` | POST | Execute action |
 | `/state` | GET | Get current state |
 | `/schema` | GET | Get action/observation JSON schemas |
-| `/ws` | WebSocket | Persistent session (used by inference script) |
+| `/ws` | WebSocket | Optional persistent transport |
 
 ### Validate
 
@@ -232,7 +229,7 @@ incident-triage-env/
 ├── openenv.yaml            # OpenEnv manifest
 ├── pyproject.toml          # Dependencies & package config
 ├── uv.lock                 # Locked dependencies
-├── inference.py            # Baseline inference script (OpenAI client)
+├── inference.py            # Deterministic inference script (stdlib HTTP client)
 └── README.md               # This file
 ```
 

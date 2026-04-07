@@ -29,7 +29,10 @@ from openai import OpenAI
 
 API_BASE_URL: str = os.environ.get("API_BASE_URL", "https://api.openai.com/v1")
 MODEL_NAME: str = os.environ.get("MODEL_NAME", "gpt-4o-mini")
-HF_TOKEN: str = os.environ.get("HF_TOKEN", os.environ.get("OPENAI_API_KEY", ""))
+HF_TOKEN: str = os.environ.get("HF_TOKEN") or ""
+
+# Optional — only needed when using from_docker_image()
+LOCAL_IMAGE_NAME: str = os.environ.get("LOCAL_IMAGE_NAME") or ""
 
 ENV_URL: str = os.environ.get("ENV_URL", "http://localhost:8000")
 
@@ -363,9 +366,7 @@ def _format_observation(obs: Dict[str, Any], step: int) -> str:
 
 def run_task(env: EnvSession, task_id: str) -> float:
     """Run a full agent episode on one task and return the final score."""
-    print(f"\n{'='*60}")
-    print(f"Task: {task_id}")
-    print(f"{'='*60}")
+    print(f"[START] task_id={task_id}", flush=True)
 
     result = env.reset(task_id=task_id)
 
@@ -378,8 +379,6 @@ def run_task(env: EnvSession, task_id: str) -> float:
         max_steps = max(int(obs.get("max_steps") or MAX_STEPS), MAX_STEPS)
     except (TypeError, ValueError):
         max_steps = MAX_STEPS
-
-    print(f"  Initial: {str(obs.get('message', ''))[:120]}…")
 
     conversation: List[Dict[str, Any]] = [
         {"role": "system", "content": SYSTEM_PROMPT},
@@ -396,13 +395,12 @@ def run_task(env: EnvSession, task_id: str) -> float:
 
         conversation.append({"role": "assistant", "content": json.dumps(action)})
 
-        if DEBUG:
-            print(f"  Step {step}: {json.dumps(action)}", flush=True)
+        cmd = action.get("command", "?")
 
         try:
             result = env.step(action)
         except Exception as exc:
-            print(f"  Step {step} ERROR: {exc}", flush=True)
+            print(f"[STEP] task_id={task_id} step={step} error={exc}", flush=True)
             break
 
         obs = result.get("observation") or {}
@@ -415,16 +413,13 @@ def run_task(env: EnvSession, task_id: str) -> float:
         if len(conversation) > 30:
             conversation = conversation[:3] + conversation[-20:]
 
-        cmd = action.get("command", "?")
-        if not DEBUG:
-            print(f"  Step {step}: {cmd:20s} reward={reward:+.4f}  {'DONE' if done else ''}")
+        print(f"[STEP] task_id={task_id} step={step} action={cmd} reward={reward:.4f}", flush=True)
 
         if done:
             break
 
     final_score = reward if done else 0.0
-    print(f"\n  Final Score: {final_score:.4f}")
-    print(f"  Steps Used:  {step}")
+    print(f"[END] task_id={task_id} score={final_score:.4f} steps={step}", flush=True)
     return final_score
 
 
@@ -434,15 +429,10 @@ def run_task(env: EnvSession, task_id: str) -> float:
 
 def main() -> None:
     """Run baseline inference across all tasks and print a summary."""
-    print("=" * 60)
-    print("Incident Triage Environment — Baseline Inference")
-    print("=" * 60)
-    print(f"LLM:         {MODEL_NAME} @ {API_BASE_URL}")
-    print(f"Environment: {ENV_URL}")
-    print()
+    print(f"model={MODEL_NAME} api_base={API_BASE_URL} env={ENV_URL}", flush=True)
 
     if not HF_TOKEN:
-        print("ERROR: No API key found. Set HF_TOKEN or OPENAI_API_KEY.", file=sys.stderr)
+        print("ERROR: No API key found. Set HF_TOKEN.", file=sys.stderr)
         sys.exit(1)
 
     scores: Dict[str, float] = {}
@@ -453,20 +443,14 @@ def main() -> None:
             env.connect()
             scores[task_id] = run_task(env, task_id)
         except Exception as exc:
-            print(f"\n  ERROR on task '{task_id}': {exc}", flush=True)
+            print(f"[END] task_id={task_id} score=0.0000 error={exc}", flush=True)
             scores[task_id] = 0.0
         finally:
             env.close()
 
-    print("\n" + "=" * 60)
-    print("RESULTS SUMMARY")
-    print("=" * 60)
-    for tid, score in scores.items():
-        print(f"  {tid:10s}: {score:.4f}")
     avg = sum(scores.values()) / len(scores) if scores else 0.0
-    print(f"  {'average':10s}: {avg:.4f}")
-    print("=" * 60)
-
+    summary = " ".join(f"{t}={s:.4f}" for t, s in scores.items())
+    print(f"[SUMMARY] {summary} average={avg:.4f}", flush=True)
 
 if __name__ == "__main__":
     main()

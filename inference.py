@@ -7,7 +7,7 @@ session to run a full agent loop across all four tasks and report scores.
 Required environment variables:
     API_BASE_URL   - LLM endpoint (default: https://api.openai.com/v1)
     MODEL_NAME     - Model identifier  (default: gpt-4o-mini)
-    HF_TOKEN       - API key (also reads OPENAI_API_KEY)
+    HF_TOKEN       - API key
     ENV_URL        - Environment server URL (default: http://localhost:8000)
 """
 
